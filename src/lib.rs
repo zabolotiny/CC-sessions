@@ -201,6 +201,74 @@ pub fn find_session_by_tag(tag: &str) -> Option<TagMatch> {
     None
 }
 
+/// A bookmark that matched a typed tag, with how well it matched:
+/// 0 exact, 1 exact ignoring case, 2 tag starts with it, 3 tag contains it
+/// (both ignoring case).
+pub struct Candidate { pub id: String, pub path: String, pub tags: Vec<String>, pub rank: u8 }
+
+/// Every bookmark whose tags match `query`, best match first; within a
+/// rank the bookmarks keep their list order.
+pub fn find_session_candidates(query: &str) -> Vec<Candidate> {
+    let q = clean_tag(query);
+    let ql = q.to_lowercase();
+    if ql.is_empty() { return Vec::new(); }
+    let b = load_bookmarks();
+    let mut out = Vec::new();
+    for (id, entry) in sessions(&b) {
+        let tags = entry_tags(entry);
+        let rank = tags.iter().filter_map(|t| {
+            let tl = t.to_lowercase();
+            if *t == q { Some(0) }
+            else if tl == ql { Some(1) }
+            else if tl.starts_with(&ql) { Some(2) }
+            else if tl.contains(&ql) { Some(3) }
+            else { None }
+        }).min();
+        if let Some(rank) = rank {
+            let path = entry.get("path").and_then(|p| p.as_str()).unwrap_or("").to_string();
+            out.push(Candidate { id: id.clone(), path, tags, rank });
+        }
+    }
+    out.sort_by_key(|c| c.rank);
+    out
+}
+
+/// Let the user choose one of several matches. None on quit, or when
+/// stdin is not a terminal.
+pub fn pick_candidate(cands: &[Candidate]) -> Option<usize> {
+    let n = cands.len();
+    if n == 0 { return None; }
+    println!("Several sessions match (\u{2191}/\u{2193}/j/k move, 1-9 or Enter select, q quit):\n");
+    print!("{}", seq::HIDE);
+    let Some(raw) = RawGuard::new() else { print!("{}", seq::SHOW); return None };
+    let clear_line = format!("{}\r", seq::ERASE_LINE);
+    let mut index = 0usize;
+    let chosen = loop {
+        for (i, c) in cands.iter().enumerate() {
+            print!("{}", clear_line);
+            let num = if i < 9 { (i + 1).to_string() } else { " ".to_string() };
+            let status = if fs::metadata(&c.path).map(|m| m.is_dir()).unwrap_or(false) {
+                String::new()
+            } else { red(" [NOT FOUND]") };
+            let line = format!("{} {} \u{2192} {}{}", dim(&num), cyan(&c.tags.join(", ")), dim(&c.path), status);
+            if i == index { println!("\u{25b8} {}", line); } else { println!("  {}", line); }
+        }
+        print!("{}", seq::up(n as u16));
+        let _ = io::stdout().flush();
+        match read_key(&raw) {
+            Key::Up => index = (index + n - 1) % n,
+            Key::Down => index = (index + 1) % n,
+            Key::Enter => break Some(index),
+            Key::Char(c @ b'1'..=b'9') if ((c - b'1') as usize) < n => break Some((c - b'1') as usize),
+            Key::Quit => break None,
+            _ => {}
+        }
+    };
+    print!("{}{}", seq::down(n as u16), seq::SHOW);
+    let _ = io::stdout().flush();
+    chosen
+}
+
 pub fn entry_tags(entry: &Value) -> Vec<String> {
     entry.get("tags").and_then(|t| t.as_array())
         .map(|a| a.iter().filter_map(|t| t.as_str().map(str::to_string)).collect())

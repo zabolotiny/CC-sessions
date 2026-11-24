@@ -8,7 +8,6 @@
 //!   cc -h, --help   Show help
 
 use cc_sessions::*;
-use serde_json::{json, Value};
 use std::fs;
 use std::os::unix::process::CommandExt;
 use std::path::PathBuf;
@@ -49,7 +48,8 @@ fn ensure_setup() {
             }
         }
     }
-    ensure_permission();
+    // Local patch: no automatic ~/.claude/settings.json rewrite (it could
+    // clobber the file when it fails to parse). Permission added by hand.
 }
 
 fn find_bm_source() -> Option<PathBuf> {
@@ -60,28 +60,6 @@ fn find_bm_source() -> Option<PathBuf> {
         if cand.is_file() { return Some(cand); }
     }
     None
-}
-
-fn ensure_permission() {
-    const PERM: &str = "Bash(cc-bookmark:*)";
-    let settings_file = home().join(".claude/settings.json");
-    let mut settings: Value = fs::read_to_string(&settings_file).ok()
-        .and_then(|s| serde_json::from_str(&s).ok())
-        .unwrap_or_else(|| json!({}));
-    let Some(obj) = settings.as_object_mut() else { return };
-    let perms = obj.entry("permissions").or_insert_with(|| json!({}));
-    let Some(perms) = perms.as_object_mut() else { return };
-    let allow = perms.entry("allow").or_insert_with(|| json!([]));
-    let Some(arr) = allow.as_array_mut() else { return };
-    if !arr.iter().any(|v| v.as_str() == Some(PERM)) {
-        arr.push(json!(PERM));
-        if let Some(dir) = settings_file.parent() { let _ = fs::create_dir_all(dir); }
-        if let Ok(s) = serde_json::to_string_pretty(&settings) {
-            let _ = fs::write(&settings_file, s);
-            println!("Added auto-accept permission for /bm command");
-            println!();
-        }
-    }
 }
 
 fn delete_bookmark_by_tag(tag: &str) {
@@ -128,6 +106,8 @@ Easily bookmark and resume Claude Code sessions with tags.
 USAGE:
   cc                     Continue session in current dir, or start new
   cc <tag>               Resume session bookmarked with <tag>
+                         (exact, else case-insensitive start/part of a tag;
+                          a picker when several match)
   cc -l, --list          Interactive list of bookmarked sessions
   cc -C, --current       Show currently running Claude Code sessions
   cc -d, --delete <tag>  Delete bookmark matching <tag>
@@ -154,24 +134,47 @@ FIRST RUN:
 }
 
 fn resume_by_tag(tag: &str) {
-    match find_session_by_tag(tag) {
-        Some(m) => resume_session(&m.id, &m.path),
-        None => {
-            println!("No session found with tag '{}'", tag);
-            println!();
-            println!("Available tags:");
-            let b = load_bookmarks();
-            if sessions(&b).is_empty() {
-                println!("  (none - use '/bm tag1 tag2' in Claude Code to bookmark)");
-            } else {
-                let mut all: Vec<String> = sessions(&b).values()
-                    .flat_map(entry_tags).collect();
-                all.sort(); all.dedup();
-                for t in all { println!("  {}", t); }
-            }
-            std::process::exit(1);
-        }
+    // Exact tag first; otherwise ignore case and accept a tag that starts
+    // with, or contains, what was typed. One best match resumes at once,
+    // several open a picker.
+    let cands = find_session_candidates(tag);
+    let best = cands.first().map(|c| c.rank);
+    let top = cands.iter().filter(|c| Some(c.rank) == best).count();
+    if cands.len() == 1 || (best.unwrap_or(9) <= 1 && top == 1) {
+        let c = &cands[0];
+        if c.rank > 0 { println!("{}", dim(&format!("Matched: {}", c.tags.join(", ")))); }
+        resume_session(&c.id, &c.path);
+        return;
     }
+    if !cands.is_empty() {
+        if unsafe { libc::isatty(0) } == 1 {
+            if let Some(i) = pick_candidate(&cands) {
+                let c = &cands[i];
+                if !fs::metadata(&c.path).map(|m| m.is_dir()).unwrap_or(false) {
+                    println!("{}", red(&format!("Directory not found: {}", c.path)));
+                    std::process::exit(1);
+                }
+                resume_session(&c.id, &c.path);
+            }
+            return;
+        }
+        println!("Several sessions match '{}':", tag);
+        for c in &cands { println!("  {} \u{2192} {}", c.tags.join(", "), c.path); }
+        std::process::exit(1);
+    }
+    println!("No session found with tag '{}'", tag);
+    println!();
+    println!("Available tags:");
+    let b = load_bookmarks();
+    if sessions(&b).is_empty() {
+        println!("  (none - use '/bm tag1 tag2' in Claude Code to bookmark)");
+    } else {
+        let mut all: Vec<String> = sessions(&b).values()
+            .flat_map(entry_tags).collect();
+        all.sort(); all.dedup();
+        for t in all { println!("  {}", t); }
+    }
+    std::process::exit(1);
 }
 
 fn continue_or_start() {
